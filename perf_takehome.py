@@ -152,10 +152,8 @@ class KernelBuilder:
 
         self.add("flow", ("pause",))
 
-        # 6-buffer system: 2 groups × 3 buffers each
-        # Group 0: buffers 0, 1, 2 (A, B, C)
-        # Group 1: buffers 3, 4, 5 (D, E, F)
-        # This allows: Load into group X, Compute group Y, Store from group Z
+        # 9-buffer system: 3 groups × 3 buffers each
+        # Enables full 3-phase overlap: Store(G-1), Compute(G), Load(G+1)
 
         def alloc_buffer_set(name):
             """Allocate a complete buffer set for one batch."""
@@ -170,8 +168,8 @@ class KernelBuilder:
                 'addr_val': self.alloc_scratch(f"addr_val_{name}"),
             }
 
-        # Allocate 6 buffer sets
-        buf = [alloc_buffer_set(chr(ord('A') + i)) for i in range(6)]
+        # Allocate 9 buffer sets (3 groups of 3)
+        buf = [alloc_buffer_set(chr(ord('A') + i)) for i in range(9)]
 
         # Vector constants
         v_zero = self.alloc_scratch("v_zero", VLEN)
@@ -251,11 +249,14 @@ class KernelBuilder:
                     (op2, b2['v_val'], b2['v_tmp1'], b2['v_tmp2']),
                 ]})
 
-            # idx computation
+            # idx computation using multiply_add: idx = idx*2 + (val&1) + 1
+            # Step 1: tmp = val & 1
+            # Step 2: tmp = tmp + 1  
+            # Step 3: idx = multiply_add(idx, 2, tmp) = idx*2 + tmp
             instrs.append({"valu": [
-                ("&", b0['v_tmp1'], b0['v_val'], v_one), ("*", b0['v_idx'], b0['v_idx'], v_two),
-                ("&", b1['v_tmp1'], b1['v_val'], v_one), ("*", b1['v_idx'], b1['v_idx'], v_two),
-                ("&", b2['v_tmp1'], b2['v_val'], v_one), ("*", b2['v_idx'], b2['v_idx'], v_two),
+                ("&", b0['v_tmp1'], b0['v_val'], v_one),
+                ("&", b1['v_tmp1'], b1['v_val'], v_one),
+                ("&", b2['v_tmp1'], b2['v_val'], v_one),
             ]})
             instrs.append({"valu": [
                 ("+", b0['v_tmp1'], b0['v_tmp1'], v_one),
@@ -263,9 +264,9 @@ class KernelBuilder:
                 ("+", b2['v_tmp1'], b2['v_tmp1'], v_one),
             ]})
             instrs.append({"valu": [
-                ("+", b0['v_idx'], b0['v_idx'], b0['v_tmp1']),
-                ("+", b1['v_idx'], b1['v_idx'], b1['v_tmp1']),
-                ("+", b2['v_idx'], b2['v_idx'], b2['v_tmp1']),
+                ("multiply_add", b0['v_idx'], b0['v_idx'], v_two, b0['v_tmp1']),
+                ("multiply_add", b1['v_idx'], b1['v_idx'], v_two, b1['v_tmp1']),
+                ("multiply_add", b2['v_idx'], b2['v_idx'], v_two, b2['v_tmp1']),
             ]})
 
             # Bounds check
@@ -275,10 +276,12 @@ class KernelBuilder:
                 ("<", b2['v_tmp1'], b2['v_idx'], v_n_nodes),
             ]})
 
-            # vselect (Flow engine - 1 slot, need 3 cycles)
-            instrs.append({"flow": [("vselect", b0['v_idx'], b0['v_tmp1'], b0['v_idx'], v_zero)]})
-            instrs.append({"flow": [("vselect", b1['v_idx'], b1['v_tmp1'], b1['v_idx'], v_zero)]})
-            instrs.append({"flow": [("vselect", b2['v_idx'], b2['v_tmp1'], b2['v_idx'], v_zero)]})
+            # Use VALU multiply instead of flow vselect (idx * cond)
+            instrs.append({"valu": [
+                ("*", b0['v_idx'], b0['v_idx'], b0['v_tmp1']),
+                ("*", b1['v_idx'], b1['v_idx'], b1['v_tmp1']),
+                ("*", b2['v_idx'], b2['v_idx'], b2['v_tmp1']),
+            ]})
 
             return instrs
 
@@ -291,11 +294,11 @@ class KernelBuilder:
                 instrs.append({"valu": [(op2, b['v_val'], b['v_tmp1'], b['v_tmp2'])]})
 
             instrs.extend([
-                {"valu": [("&", b['v_tmp1'], b['v_val'], v_one), ("*", b['v_idx'], b['v_idx'], v_two)]},
+                {"valu": [("&", b['v_tmp1'], b['v_val'], v_one)]},
                 {"valu": [("+", b['v_tmp1'], b['v_tmp1'], v_one)]},
-                {"valu": [("+", b['v_idx'], b['v_idx'], b['v_tmp1'])]},
+                {"valu": [("multiply_add", b['v_idx'], b['v_idx'], v_two, b['v_tmp1'])]},
                 {"valu": [("<", b['v_tmp1'], b['v_idx'], v_n_nodes)]},
-                {"flow": [("vselect", b['v_idx'], b['v_tmp1'], b['v_idx'], v_zero)]},
+                {"valu": [("*", b['v_idx'], b['v_idx'], b['v_tmp1'])]},
             ])
             return instrs
 
@@ -378,43 +381,46 @@ class KernelBuilder:
                 body_instrs.extend(emit_compute_single(b))
                 body_instrs.extend(emit_store(batch_offsets[batch_idx], b))
         else:
-            # Process in groups of 3 with cross-group pipelining
-            # Group 0 uses buf[0:3], Group 1 uses buf[3:6]
+            # 3-phase pipelining with 9 buffers
             num_groups = total_batches // 3
             remainder = total_batches % 3
 
-            # Prologue: Load first group into buf[0:3]
+            def get_group_bufs(group_idx):
+                base = (group_idx % 3) * 3
+                return buf[base:base+3]
+
+            # Prologue: Load first group
             for i in range(3):
                 body_instrs.extend(emit_load_full(batch_offsets[i], buf[i]))
 
-            # Main loop with pipelining:
-            # - Compute current group (overlapped with next group's load)
-            # - Store current group after compute completes
+            # Main loop: Store(G-1), Compute(G), Load(G+1) - all overlapped!
             for group in range(num_groups):
-                base_idx = group * 3
-
-                # Which buffer set to use (alternates)
-                compute_bufs = buf[0:3] if (group % 2 == 0) else buf[3:6]
-                load_bufs = buf[3:6] if (group % 2 == 0) else buf[0:3]
-
-                # Compute current group
+                compute_bufs = get_group_bufs(group)
                 compute_instrs = emit_compute_3_parallel(compute_bufs[0], compute_bufs[1], compute_bufs[2])
 
-                # Load next group (if any) - overlapped with compute
+                store_instrs = []
+                if group > 0:
+                    store_bufs = get_group_bufs(group - 1)
+                    store_base = (group - 1) * 3
+                    for i in range(3):
+                        store_instrs.extend(emit_store(batch_offsets[store_base + i], store_bufs[i]))
+
                 load_instrs = []
                 if group < num_groups - 1:
-                    next_base = (group + 1) * 3
+                    load_bufs = get_group_bufs(group + 1)
+                    load_base = (group + 1) * 3
                     for i in range(3):
-                        load_instrs.extend(emit_load_full(batch_offsets[next_base + i], load_bufs[i]))
+                        load_instrs.extend(emit_load_full(batch_offsets[load_base + i], load_bufs[i]))
 
-                # Interleave compute with next group's load
-                body_instrs.extend(interleave_phases(compute_instrs, load_instrs, []))
+                body_instrs.extend(interleave_phases(compute_instrs, load_instrs, store_instrs))
 
-                # Store current group (must complete before we load into these buffers again)
-                for i in range(3):
-                    body_instrs.extend(emit_store(batch_offsets[base_idx + i], compute_bufs[i]))
+            # Epilogue: Store final group
+            store_bufs = get_group_bufs(num_groups - 1)
+            store_base = (num_groups - 1) * 3
+            for i in range(3):
+                body_instrs.extend(emit_store(batch_offsets[store_base + i], store_bufs[i]))
 
-            # Handle remaining 1-2 batches
+            # Handle remainder
             for i in range(remainder):
                 batch_idx = num_groups * 3 + i
                 b = buf[i]
