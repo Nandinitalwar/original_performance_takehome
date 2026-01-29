@@ -214,6 +214,73 @@ class KernelBuilder:
                 ]})
             return instrs
 
+        def emit_load_3_parallel(offsets, bufs):
+            """Emit loads for 3 batches with optimized interleaving.
+            
+            Key insight: After computing batch N's node addresses, we can start
+            loading batch N's node values while computing batch N+1's addresses.
+            This overlaps ALU with Load operations.
+            """
+            b0, b1, b2 = bufs
+            off0, off1, off2 = [self.scratch_const(o) for o in offsets]
+            
+            instrs = []
+            
+            # Phase 1: Compute all memory addresses (ALU) - 6 ops, 1 cycle
+            instrs.append({"alu": [
+                ("+", b0['addr_idx'], self.scratch["inp_indices_p"], off0),
+                ("+", b0['addr_val'], self.scratch["inp_values_p"], off0),
+                ("+", b1['addr_idx'], self.scratch["inp_indices_p"], off1),
+                ("+", b1['addr_val'], self.scratch["inp_values_p"], off1),
+                ("+", b2['addr_idx'], self.scratch["inp_indices_p"], off2),
+                ("+", b2['addr_val'], self.scratch["inp_values_p"], off2),
+            ]})
+            
+            # Phase 2: Vector loads for idx/val (6 loads = 3 cycles at 2 loads/cycle)
+            instrs.append({"load": [("vload", b0['v_idx'], b0['addr_idx']), ("vload", b0['v_val'], b0['addr_val'])]})
+            instrs.append({"load": [("vload", b1['v_idx'], b1['addr_idx']), ("vload", b1['v_val'], b1['addr_val'])]})
+            instrs.append({"load": [("vload", b2['v_idx'], b2['addr_idx']), ("vload", b2['v_val'], b2['addr_val'])]})
+            
+            # Phase 3: Interleave node_addr computation with node value loads
+            # Batch 0 node addrs (8 ALU ops)
+            instrs.append({"alu": [("+", b0['node_addrs'][j], self.scratch["forest_values_p"], b0['v_idx'] + j) for j in range(VLEN)]})
+            
+            # Batch 0 first 2 loads + batch 1 node addrs (8 ALU ops)
+            instrs.append({"load": [
+                ("load", b0['v_node_val'] + 0, b0['node_addrs'][0]),
+                ("load", b0['v_node_val'] + 1, b0['node_addrs'][1]),
+            ], "alu": [("+", b1['node_addrs'][j], self.scratch["forest_values_p"], b1['v_idx'] + j) for j in range(VLEN)]})
+            
+            # Batch 0 next 2 loads + batch 2 node addrs (8 ALU ops)
+            instrs.append({"load": [
+                ("load", b0['v_node_val'] + 2, b0['node_addrs'][2]),
+                ("load", b0['v_node_val'] + 3, b0['node_addrs'][3]),
+            ], "alu": [("+", b2['node_addrs'][j], self.scratch["forest_values_p"], b2['v_idx'] + j) for j in range(VLEN)]})
+            
+            # Batch 0 last 2 loads + batch 1 first 2 loads
+            instrs.append({"load": [
+                ("load", b0['v_node_val'] + 4, b0['node_addrs'][4]),
+                ("load", b0['v_node_val'] + 5, b0['node_addrs'][5]),
+            ]})
+            instrs.append({"load": [
+                ("load", b0['v_node_val'] + 6, b0['node_addrs'][6]),
+                ("load", b0['v_node_val'] + 7, b0['node_addrs'][7]),
+            ]})
+            
+            # Remaining batch 1 and batch 2 scalar loads
+            for j in range(0, VLEN, 2):
+                instrs.append({"load": [
+                    ("load", b1['v_node_val'] + j, b1['node_addrs'][j]),
+                    ("load", b1['v_node_val'] + j + 1, b1['node_addrs'][j + 1]),
+                ]})
+            for j in range(0, VLEN, 2):
+                instrs.append({"load": [
+                    ("load", b2['v_node_val'] + j, b2['node_addrs'][j]),
+                    ("load", b2['v_node_val'] + j + 1, b2['node_addrs'][j + 1]),
+                ]})
+            
+            return instrs
+
         def emit_store(offset, b):
             """Emit store for a buffer."""
             offset_const = self.scratch_const(offset)
@@ -304,62 +371,67 @@ class KernelBuilder:
 
         def interleave_phases(compute_instrs, load_instrs, store_instrs):
             """
-            Interleave compute (VALU/Flow) with load (ALU/Load) and store (ALU/Store).
-            IMPORTANT: Stores are prioritized over loads to ensure correct ordering
-            when they access the same buffers.
+            Interleave compute (VALU) with load (ALU/Load) and store (ALU/Store).
+            IMPORTANT: Instructions are processed in order to maintain dependencies.
+            Alternates between trying store and load first to spread them evenly.
+            This ensures the final compute cycle can still merge with a load instruction.
             """
             result = []
             ci, li, si = 0, 0, 0
+            store_first = True  # Alternate which to try first
+            
+            # Slot limits
+            LIMITS = {"alu": 12, "valu": 6, "load": 2, "store": 2, "flow": 1}
+
+            def can_add(merged, instr):
+                """Check if instr can be added to merged without exceeding limits."""
+                for eng, slots in instr.items():
+                    current = len(merged.get(eng, []))
+                    if current + len(slots) > LIMITS.get(eng, 0):
+                        return False
+                return True
+
+            def add_instr(merged, instr):
+                """Add instr to merged."""
+                for eng, slots in instr.items():
+                    if eng not in merged:
+                        merged[eng] = []
+                    merged[eng].extend(slots)
 
             while ci < len(compute_instrs) or li < len(load_instrs) or si < len(store_instrs):
                 merged = {}
 
-                # Add compute first
+                # Add compute first (always succeeds for one VALU instruction)
                 if ci < len(compute_instrs):
-                    for eng, slots in compute_instrs[ci].items():
-                        merged[eng] = list(slots)
+                    add_instr(merged, compute_instrs[ci])
                     ci += 1
 
-                # Try to add STORE first (priority over load for correctness!)
-                if si < len(store_instrs):
-                    store_instr = store_instrs[si]
-                    can_merge = True
-                    for eng, slots in store_instr.items():
-                        if eng in merged:
-                            if eng == "alu" and len(merged.get("alu", [])) + len(slots) <= 12:
-                                continue
-                            can_merge = False
-                            break
-                    if can_merge:
-                        for eng, slots in store_instr.items():
-                            if eng in merged:
-                                merged[eng].extend(slots)
-                            else:
-                                merged[eng] = list(slots)
+                # Alternate priority between store and load to spread them evenly
+                if store_first:
+                    # Try store first
+                    if si < len(store_instrs) and can_add(merged, store_instrs[si]):
+                        add_instr(merged, store_instrs[si])
                         si += 1
-
-                # Then try to add load
-                if li < len(load_instrs):
-                    load_instr = load_instrs[li]
-                    can_merge = True
-                    for eng, slots in load_instr.items():
-                        if eng in merged:
-                            if eng == "alu" and len(merged["alu"]) + len(slots) <= 12:
-                                continue
-                            can_merge = False
-                            break
-                    if can_merge:
-                        for eng, slots in load_instr.items():
-                            if eng in merged:
-                                merged[eng].extend(slots)
-                            else:
-                                merged[eng] = list(slots)
+                    # Then try load
+                    if li < len(load_instrs) and can_add(merged, load_instrs[li]):
+                        add_instr(merged, load_instrs[li])
                         li += 1
+                else:
+                    # Try load first
+                    if li < len(load_instrs) and can_add(merged, load_instrs[li]):
+                        add_instr(merged, load_instrs[li])
+                        li += 1
+                    # Then try store
+                    if si < len(store_instrs) and can_add(merged, store_instrs[si]):
+                        add_instr(merged, store_instrs[si])
+                        si += 1
+                
+                store_first = not store_first  # Alternate for next cycle
 
                 if merged:
                     result.append(merged)
 
-            # Remaining - stores first, then loads
+            # Remaining instructions
             while si < len(store_instrs):
                 result.append(store_instrs[si])
                 si += 1
@@ -409,8 +481,8 @@ class KernelBuilder:
                 if group < num_groups - 1:
                     load_bufs = get_group_bufs(group + 1)
                     load_base = (group + 1) * 3
-                    for i in range(3):
-                        load_instrs.extend(emit_load_full(batch_offsets[load_base + i], load_bufs[i]))
+                    load_offsets = [batch_offsets[load_base + i] for i in range(3)]
+                    load_instrs = emit_load_3_parallel(load_offsets, load_bufs)
 
                 body_instrs.extend(interleave_phases(compute_instrs, load_instrs, store_instrs))
 
