@@ -204,10 +204,12 @@ class KernelBuilder:
         const_broadcasts.append((two_const, v_two))
         const_broadcasts.append((n_nodes_const, v_n_nodes))
 
-        # Now emit broadcasts in parallel batches (6 VALU ops per cycle)
+        # Store broadcasts for later merging with prologue load
+        # This saves cycles by doing VALU broadcasts during Load cycles
+        broadcast_instrs = []
         for i in range(0, len(const_broadcasts), 6):
             batch = const_broadcasts[i:i+6]
-            self.instrs.append({"valu": [("vbroadcast", vec, scalar) for scalar, vec in batch]})
+            broadcast_instrs.append({"valu": [("vbroadcast", vec, scalar) for scalar, vec in batch]})
 
         # Build batch offset list
         batches_per_round = batch_size // VLEN
@@ -359,7 +361,11 @@ class KernelBuilder:
             return instrs
 
         def emit_load_6_parallel(offsets, bufs):
-            """Emit loads for 6 batches with maximally interleaved ALU and Load operations."""
+            """Emit loads for 6 batches with deeply interleaved operations.
+
+            Key optimization: Start scalar loads as soon as node_addrs are computed,
+            overlapping with remaining vloads and addr computations.
+            """
             instrs = []
             off_consts = [self.scratch_const(o) for o in offsets]
 
@@ -372,29 +378,58 @@ class KernelBuilder:
                 for i in range(6)
             ]})
 
-            # Phase 2: Interleave vloads with node_addr computation
-            # Cycle 1: vload batch 0 + compute node_addrs for batch 0
+            # Phase 2: Deeply interleaved loading
+            # Cycle 1: vload B0
             instrs.append({"load": [("vload", bufs[0]['v_idx'], bufs[0]['addr_idx']),
                                     ("vload", bufs[0]['v_val'], bufs[0]['addr_val'])]})
 
-            # Cycles 2-6: vload batch i while computing node_addrs for batch i-1 (ALU+Load parallel)
-            for i in range(1, 6):
-                instrs.append({"load": [("vload", bufs[i]['v_idx'], bufs[i]['addr_idx']),
-                                        ("vload", bufs[i]['v_val'], bufs[i]['addr_val'])],
-                               "alu": [("+", bufs[i-1]['node_addrs'][j], self.scratch["forest_values_p"], bufs[i-1]['v_idx'] + j) for j in range(VLEN)]})
+            # Cycle 2: vload B1, compute B0's node_addrs
+            instrs.append({"load": [("vload", bufs[1]['v_idx'], bufs[1]['addr_idx']),
+                                    ("vload", bufs[1]['v_val'], bufs[1]['addr_val'])],
+                           "alu": [("+", bufs[0]['node_addrs'][j], self.scratch["forest_values_p"], bufs[0]['v_idx'] + j) for j in range(VLEN)]})
 
-            # Cycle 7: compute node_addrs for batch 5
-            instrs.append({"alu": [("+", bufs[5]['node_addrs'][j], self.scratch["forest_values_p"], bufs[5]['v_idx'] + j) for j in range(VLEN)]})
+            # Cycle 3: vload B2, compute B1's node_addrs - B0's scalar loads can now start!
+            # But we can only do 2 loads per cycle, so we need to continue in following cycles
+            instrs.append({"load": [("vload", bufs[2]['v_idx'], bufs[2]['addr_idx']),
+                                    ("vload", bufs[2]['v_val'], bufs[2]['addr_val'])],
+                           "alu": [("+", bufs[1]['node_addrs'][j], self.scratch["forest_values_p"], bufs[1]['v_idx'] + j) for j in range(VLEN)]})
 
-            # Phase 3: Scalar node value loads (6 batches × 4 cycles each = 24 cycles, but try to overlap)
-            # Load all batches' node values at 2 loads/cycle
-            # This is 48 loads total = 24 cycles minimum
-            for batch_idx in range(6):
+            # Cycle 4: vload B3, compute B2's node_addrs
+            instrs.append({"load": [("vload", bufs[3]['v_idx'], bufs[3]['addr_idx']),
+                                    ("vload", bufs[3]['v_val'], bufs[3]['addr_val'])],
+                           "alu": [("+", bufs[2]['node_addrs'][j], self.scratch["forest_values_p"], bufs[2]['v_idx'] + j) for j in range(VLEN)]})
+
+            # Cycle 5: vload B4, compute B3's node_addrs
+            instrs.append({"load": [("vload", bufs[4]['v_idx'], bufs[4]['addr_idx']),
+                                    ("vload", bufs[4]['v_val'], bufs[4]['addr_val'])],
+                           "alu": [("+", bufs[3]['node_addrs'][j], self.scratch["forest_values_p"], bufs[3]['v_idx'] + j) for j in range(VLEN)]})
+
+            # Cycle 6: vload B5, compute B4's node_addrs
+            instrs.append({"load": [("vload", bufs[5]['v_idx'], bufs[5]['addr_idx']),
+                                    ("vload", bufs[5]['v_val'], bufs[5]['addr_val'])],
+                           "alu": [("+", bufs[4]['node_addrs'][j], self.scratch["forest_values_p"], bufs[4]['v_idx'] + j) for j in range(VLEN)]})
+
+            # Cycle 7: compute B5's node_addrs, start B0's scalar loads
+            instrs.append({"load": [
+                ("load", bufs[0]['v_node_val'] + 0, bufs[0]['node_addrs'][0]),
+                ("load", bufs[0]['v_node_val'] + 1, bufs[0]['node_addrs'][1]),
+            ], "alu": [("+", bufs[5]['node_addrs'][j], self.scratch["forest_values_p"], bufs[5]['v_idx'] + j) for j in range(VLEN)]})
+
+            # Remaining scalar loads: 46 loads at 2/cycle = 23 cycles
+            # B0: 6 more loads (indices 2-7)
+            # B1-B5: 8 loads each = 40 loads
+            remaining_loads = []
+            for j in range(2, VLEN, 2):
+                remaining_loads.append((0, j))
+            for batch_idx in range(1, 6):
                 for j in range(0, VLEN, 2):
-                    instrs.append({"load": [
-                        ("load", bufs[batch_idx]['v_node_val'] + j, bufs[batch_idx]['node_addrs'][j]),
-                        ("load", bufs[batch_idx]['v_node_val'] + j + 1, bufs[batch_idx]['node_addrs'][j + 1]),
-                    ]})
+                    remaining_loads.append((batch_idx, j))
+
+            for batch_idx, j in remaining_loads:
+                instrs.append({"load": [
+                    ("load", bufs[batch_idx]['v_node_val'] + j, bufs[batch_idx]['node_addrs'][j]),
+                    ("load", bufs[batch_idx]['v_node_val'] + j + 1, bufs[batch_idx]['node_addrs'][j + 1]),
+                ]})
 
             return instrs
 
@@ -749,13 +784,19 @@ class KernelBuilder:
                 if merged:
                     result.append(merged)
 
-            # Remaining instructions
-            while si < len(store_instrs):
-                result.append(store_instrs[si])
-                si += 1
-            while li < len(load_instrs):
-                result.append(load_instrs[li])
-                li += 1
+            # Remaining instructions - MERGE stores with loads!
+            while si < len(store_instrs) or li < len(load_instrs):
+                merged = {}
+                # Try to add a store
+                if si < len(store_instrs) and can_add(merged, store_instrs[si]):
+                    add_instr(merged, store_instrs[si])
+                    si += 1
+                # Try to add a load
+                if li < len(load_instrs) and can_add(merged, load_instrs[li]):
+                    add_instr(merged, load_instrs[li])
+                    li += 1
+                if merged:
+                    result.append(merged)
 
             return result
 
@@ -780,22 +821,34 @@ class KernelBuilder:
                 base = (group_idx % 3) * BATCHES_PER_GROUP
                 return buf[base:base+BATCHES_PER_GROUP]
 
-            # Prologue: Load first group
+            # Prologue: Load first group, merged with constant broadcasts
             prologue_offsets = [batch_offsets[i] for i in range(BATCHES_PER_GROUP)]
-            body_instrs.extend(emit_load_6_parallel(prologue_offsets, buf[0:BATCHES_PER_GROUP]))
+            prologue_load_instrs = emit_load_6_parallel(prologue_offsets, buf[0:BATCHES_PER_GROUP])
 
-            # Main loop: Store(G-1), Compute(G), Load(G+1) - all overlapped!
+            # Merge broadcasts with prologue loads to save cycles
+            bi = 0
+            for li, load_instr in enumerate(prologue_load_instrs):
+                if bi < len(broadcast_instrs):
+                    # Merge broadcast VALU with load instruction
+                    for eng, slots in broadcast_instrs[bi].items():
+                        if eng not in load_instr:
+                            load_instr[eng] = []
+                        load_instr[eng].extend(slots)
+                    bi += 1
+                body_instrs.append(load_instr)
+
+            # Append any remaining broadcasts
+            while bi < len(broadcast_instrs):
+                body_instrs.append(broadcast_instrs[bi])
+                bi += 1
+
+            # Main loop: Compute(G) + Load(G+1), then Store(G) merged with remaining Load(G+1)
+            # This structure ensures stores happen AFTER compute and merge with load tail
             for group in range(num_groups):
                 compute_bufs = get_group_bufs(group)
                 compute_instrs = emit_compute_6_parallel(compute_bufs)
 
-                store_instrs = []
-                if group > 0:
-                    store_bufs = get_group_bufs(group - 1)
-                    store_base = (group - 1) * BATCHES_PER_GROUP
-                    store_offsets = [batch_offsets[store_base + i] for i in range(BATCHES_PER_GROUP)]
-                    store_instrs = emit_store_6(store_offsets, store_bufs)
-
+                # Load next group
                 load_instrs = []
                 if group < num_groups - 1:
                     load_bufs = get_group_bufs(group + 1)
@@ -803,13 +856,49 @@ class KernelBuilder:
                     load_offsets = [batch_offsets[load_base + i] for i in range(BATCHES_PER_GROUP)]
                     load_instrs = emit_load_6_parallel(load_offsets, load_bufs)
 
-                body_instrs.extend(interleave_phases(compute_instrs, load_instrs, store_instrs))
+                # Store current group AFTER compute (can merge with remaining loads)
+                curr_store_instrs = emit_store_6(
+                    [batch_offsets[group * BATCHES_PER_GROUP + i] for i in range(BATCHES_PER_GROUP)],
+                    compute_bufs
+                )
 
-            # Epilogue: Store final group
-            store_bufs = get_group_bufs(num_groups - 1)
-            store_base = (num_groups - 1) * BATCHES_PER_GROUP
-            store_offsets = [batch_offsets[store_base + i] for i in range(BATCHES_PER_GROUP)]
-            body_instrs.extend(emit_store_6(store_offsets, store_bufs))
+                # Custom interleave: compute first, then store+remaining_loads
+                result = []
+                ci, li = 0, 0
+
+                # Phase 1: Compute + Load (as much as fits)
+                while ci < len(compute_instrs):
+                    merged = dict(compute_instrs[ci])
+                    ci += 1
+                    # Try to add loads
+                    if li < len(load_instrs):
+                        for eng, slots in load_instrs[li].items():
+                            if eng not in merged:
+                                merged[eng] = []
+                            merged[eng].extend(slots)
+                        li += 1
+                    result.append(merged)
+
+                # Phase 2: Store + remaining Load (after compute)
+                si = 0
+                while si < len(curr_store_instrs) or li < len(load_instrs):
+                    merged = {}
+                    if si < len(curr_store_instrs):
+                        for eng, slots in curr_store_instrs[si].items():
+                            if eng not in merged:
+                                merged[eng] = []
+                            merged[eng].extend(slots)
+                        si += 1
+                    if li < len(load_instrs):
+                        for eng, slots in load_instrs[li].items():
+                            if eng not in merged:
+                                merged[eng] = []
+                            merged[eng].extend(slots)
+                        li += 1
+                    if merged:
+                        result.append(merged)
+
+                body_instrs.extend(result)
 
             # Handle remainder (2 batches for 512/6)
             remainder_start = num_groups * BATCHES_PER_GROUP
